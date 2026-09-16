@@ -1,0 +1,1599 @@
+import os
+import sys
+import csv
+import time
+import math
+import requests
+import numpy as np
+from typing import Any, Dict, List, Optional
+
+
+BASE_URL = "https://api.rentcast.io/v1"
+
+DEFAULT_LISTING_LIMIT = 100
+DEFAULT_MAX_LISTINGS = 100
+DEFAULT_HISTORY_MONTHS = 12
+DEFAULT_MAX_AVM_REQUESTS = 50
+
+REQUEST_TIMEOUT = 20
+
+REPAIR_COSTS_PER_SQFT = {
+    "foundation": 55.0,
+    "mold": 30.0,
+    "roof": 40.0,
+    "fire": 75.0,
+    "flood": 60.0,
+    "termite": 25.0,
+    "tlc": 15.0,
+    "fixer": 20.0,
+    "renovation": 20.0,
+    "remodel": 20.0,
+    "rehab": 25.0,
+    "water damage": 35.0,
+    "water-damaged": 35.0,
+    "smoke damage": 45.0,
+    "smoke-damaged": 45.0,
+    "as-is": 10.0,
+    "needs work": 15.0,
+    "needs repair": 20.0,
+    "investor special": 15.0
+}
+
+
+def create_session(api_key: str) -> requests.Session:
+    session = requests.Session()
+
+    session.headers.update({
+        "Accept": "application/json",
+        "X-Api-Key": api_key
+    })
+
+    return session
+
+
+def api_get(
+    session: requests.Session,
+    endpoint: str,
+    params: Optional[Dict[str, Any]] = None
+) -> Any:
+    url = f"{BASE_URL}{endpoint}"
+
+    response = session.get(
+        url,
+        params=params,
+        timeout=REQUEST_TIMEOUT
+    )
+
+    if response.status_code == 401:
+        raise RuntimeError(
+            "RentCast API authentication failed. "
+            "Check your API key."
+        )
+
+    if response.status_code == 403:
+        raise RuntimeError(
+            "RentCast API request was forbidden. "
+            "Check your API plan and endpoint access."
+        )
+
+    if response.status_code == 429:
+        raise RuntimeError(
+            "RentCast API rate limit reached. "
+            "Reduce the number of requests or wait before retrying."
+        )
+
+    if not response.ok:
+        try:
+            details = response.json()
+        except Exception:
+            details = response.text
+
+        raise RuntimeError(
+            f"RentCast API error {response.status_code}: {details}"
+        )
+
+    try:
+        return response.json()
+    except ValueError:
+        raise RuntimeError(
+            "RentCast returned an invalid JSON response."
+        )
+
+
+def validate_zip_code(zip_code: str) -> str:
+    zip_code = str(zip_code).strip()
+
+    if len(zip_code) != 5 or not zip_code.isdigit():
+        raise ValueError(
+            "ZIP code must be exactly 5 digits."
+        )
+
+    return zip_code
+
+
+def fetch_market_data(
+    session: requests.Session,
+    zip_code: str,
+    history_months: int = DEFAULT_HISTORY_MONTHS
+) -> Dict[str, Any]:
+    zip_code = validate_zip_code(zip_code)
+
+    params = {
+        "zipCode": zip_code,
+        "dataType": "All",
+        "historyRange": history_months
+    }
+
+    return api_get(
+        session,
+        "/markets",
+        params
+    )
+
+
+def extract_history_series(
+    market_data: Dict[str, Any]
+) -> Dict[str, List[Any]]:
+    sale_data = market_data.get(
+        "saleData",
+        {}
+    )
+
+    rental_data = market_data.get(
+        "rentalData",
+        {}
+    )
+
+    sale_history = sale_data.get(
+        "history",
+        {}
+    )
+
+    rental_history = rental_data.get(
+        "history",
+        {}
+    )
+
+    sale_series = []
+    rental_series = []
+
+    if isinstance(sale_history, dict):
+        for month, values in sorted(
+            sale_history.items()
+        ):
+            if not isinstance(values, dict):
+                continue
+
+            price = values.get("averagePrice")
+
+            if price is not None:
+                try:
+                    sale_series.append({
+                        "month": month,
+                        "value": float(price)
+                    })
+                except (ValueError, TypeError):
+                    pass
+
+    if isinstance(rental_history, dict):
+        for month, values in sorted(
+            rental_history.items()
+        ):
+            if not isinstance(values, dict):
+                continue
+
+            rent = values.get("averageRent")
+
+            if rent is not None:
+                try:
+                    rental_series.append({
+                        "month": month,
+                        "value": float(rent)
+                    })
+                except (ValueError, TypeError):
+                    pass
+
+    return {
+        "sale": sale_series,
+        "rental": rental_series
+    }
+
+
+def calculate_percentage_change(
+    values: List[float]
+) -> float:
+    if len(values) < 2:
+        return 0.0
+
+    starting_value = values[0]
+    ending_value = values[-1]
+
+    if starting_value == 0:
+        return 0.0
+
+    return (
+        (ending_value - starting_value)
+        / abs(starting_value)
+    ) * 100.0
+
+
+def calculate_acceleration(
+    values: List[float]
+) -> float:
+    if len(values) < 3:
+        return 0.0
+
+    array = np.array(
+        values,
+        dtype=float
+    )
+
+    time_steps = np.arange(
+        len(array),
+        dtype=float
+    )
+
+    velocity = np.gradient(
+        array,
+        time_steps
+    )
+
+    acceleration = np.gradient(
+        velocity,
+        time_steps
+    )
+
+    return float(
+        acceleration[-1]
+    )
+
+
+def calculate_market_metrics(
+    market_data: Dict[str, Any]
+) -> Dict[str, Any]:
+    series = extract_history_series(
+        market_data
+    )
+
+    sale_series = series["sale"]
+    rental_series = series["rental"]
+
+    sale_values = [
+        item["value"]
+        for item in sale_series
+    ]
+
+    rental_values = [
+        item["value"]
+        for item in rental_series
+    ]
+
+    current_sale_price = None
+    current_rent = None
+
+    if sale_values:
+        current_sale_price = sale_values[-1]
+
+    if rental_values:
+        current_rent = rental_values[-1]
+
+    sale_growth = calculate_percentage_change(
+        sale_values
+    )
+
+    rental_growth = calculate_percentage_change(
+        rental_values
+    )
+
+    price_acceleration = calculate_acceleration(
+        sale_values
+    )
+
+    rental_acceleration = calculate_acceleration(
+        rental_values
+    )
+
+    return {
+        "sale_history": sale_series,
+        "rental_history": rental_series,
+        "current_sale_price": current_sale_price,
+        "current_rent": current_rent,
+        "sale_growth_percent": sale_growth,
+        "rental_growth_percent": rental_growth,
+        "price_acceleration": price_acceleration,
+        "rental_acceleration": rental_acceleration,
+        "history_points_sale": len(sale_values),
+        "history_points_rental": len(rental_values)
+    }
+
+
+def calculate_market_score(
+    metrics: Dict[str, Any]
+) -> float:
+    score = 50.0
+
+    sale_growth = metrics.get(
+        "sale_growth_percent",
+        0.0
+    )
+
+    rental_growth = metrics.get(
+        "rental_growth_percent",
+        0.0
+    )
+
+    price_acceleration = metrics.get(
+        "price_acceleration",
+        0.0
+    )
+
+    rental_acceleration = metrics.get(
+        "rental_acceleration",
+        0.0
+    )
+
+    if sale_growth > 0:
+        score += min(
+            sale_growth * 2.0,
+            15.0
+        )
+    else:
+        score += max(
+            sale_growth * 1.0,
+            -15.0
+        )
+
+    if rental_growth > 0:
+        score += min(
+            rental_growth * 1.5,
+            12.0
+        )
+    else:
+        score += max(
+            rental_growth * 0.75,
+            -12.0
+        )
+
+    if price_acceleration > 0:
+        score += 8.0
+
+    if rental_acceleration > 0:
+        score += 5.0
+
+    return max(
+        0.0,
+        min(
+            score,
+            100.0
+        )
+    )
+
+
+def fetch_sale_listings(
+    session: requests.Session,
+    zip_code: str,
+    max_listings: int = DEFAULT_MAX_LISTINGS
+) -> List[Dict[str, Any]]:
+    zip_code = validate_zip_code(zip_code)
+
+    listings = []
+    offset = 0
+
+    while len(listings) < max_listings:
+        remaining = max_listings - len(listings)
+
+        limit = min(
+            DEFAULT_LISTING_LIMIT,
+            remaining
+        )
+
+        params = {
+            "zipCode": zip_code,
+            "status": "Active",
+            "propertyType": "Single Family",
+            "limit": limit,
+            "offset": offset
+        }
+
+        data = api_get(
+            session,
+            "/listings/sale",
+            params
+        )
+
+        if not isinstance(data, list):
+            break
+
+        if not data:
+            break
+
+        listings.extend(data)
+
+        if len(data) < limit:
+            break
+
+        offset += len(data)
+
+        if offset >= max_listings:
+            break
+
+    return listings[:max_listings]
+
+
+def extract_numeric(
+    value: Any,
+    default: float = 0.0
+) -> float:
+    try:
+        if value is None:
+            return default
+
+        number = float(value)
+
+        if not math.isfinite(number):
+            return default
+
+        return number
+
+    except (ValueError, TypeError):
+        return default
+
+
+def build_property_text(
+    listing: Dict[str, Any],
+    property_data: Optional[Dict[str, Any]]
+) -> str:
+    parts = []
+
+    for key in [
+        "listingType",
+        "propertyType",
+        "formattedAddress"
+    ]:
+        value = listing.get(key)
+
+        if value:
+            parts.append(
+                str(value)
+            )
+
+    if property_data:
+        features = property_data.get(
+            "features",
+            {}
+        )
+
+        if isinstance(features, dict):
+            for value in features.values():
+                if isinstance(value, str):
+                    parts.append(value)
+
+    history = listing.get(
+        "history",
+        {}
+    )
+
+    if isinstance(history, dict):
+        for value in history.values():
+            if isinstance(value, dict):
+                event = value.get("event")
+
+                if event:
+                    parts.append(
+                        str(event)
+                    )
+
+    return " ".join(
+        parts
+    ).lower()
+
+
+def detect_repair_risks(
+    listing: Dict[str, Any],
+    property_data: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    text = build_property_text(
+        listing,
+        property_data
+    )
+
+    detected = {}
+    total_rate = 0.0
+
+    for keyword, cost_per_sqft in REPAIR_COSTS_PER_SQFT.items():
+        if keyword in text:
+            detected[keyword] = cost_per_sqft
+            total_rate += cost_per_sqft
+
+    sqft = extract_numeric(
+        listing.get("squareFootage")
+    )
+
+    estimated_repair_cost = (
+        sqft * total_rate
+    )
+
+    return {
+        "detected_keywords": list(
+            detected.keys()
+        ),
+        "repair_rate_per_sqft": total_rate,
+        "estimated_repair_cost": estimated_repair_cost
+    }
+
+
+def fetch_property_record(
+    session: requests.Session,
+    address: str
+) -> Optional[Dict[str, Any]]:
+    if not address:
+        return None
+
+    params = {
+        "address": address
+    }
+
+    try:
+        data = api_get(
+            session,
+            "/properties",
+            params
+        )
+
+        if isinstance(data, list):
+            if data:
+                return data[0]
+
+            return None
+
+        if isinstance(data, dict):
+            return data
+
+        return None
+
+    except Exception:
+        return None
+
+
+def fetch_avm_value(
+    session: requests.Session,
+    address: str,
+    cache: Dict[str, Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    if not address:
+        return None
+
+    if address in cache:
+        return cache[address]
+
+    params = {
+        "address": address
+    }
+
+    try:
+        data = api_get(
+            session,
+            "/avm/value",
+            params
+        )
+
+        if isinstance(data, dict):
+            cache[address] = data
+            return data
+
+    except Exception:
+        return None
+
+    return None
+
+
+def calculate_price_discount(
+    asking_price: float,
+    estimated_value: float
+) -> float:
+    if asking_price <= 0:
+        return 0.0
+
+    return (
+        (
+            estimated_value
+            - asking_price
+        )
+        / asking_price
+    ) * 100.0
+
+
+def calculate_rental_yield(
+    monthly_rent: Optional[float],
+    purchase_price: float
+) -> float:
+    if (
+        monthly_rent is None
+        or monthly_rent <= 0
+        or purchase_price <= 0
+    ):
+        return 0.0
+
+    return (
+        monthly_rent * 12
+        / purchase_price
+    ) * 100.0
+
+
+def estimate_monthly_rent(
+    session: requests.Session,
+    address: str,
+    cache: Dict[str, Dict[str, Any]]
+) -> Optional[float]:
+    if not address:
+        return None
+
+    if address in cache:
+        data = cache[address]
+    else:
+        params = {
+            "address": address
+        }
+
+        try:
+            data = api_get(
+                session,
+                "/avm/rent/long-term",
+                params
+            )
+
+            if not isinstance(data, dict):
+                return None
+
+            cache[address] = data
+
+        except Exception:
+            return None
+
+    rent = extract_numeric(
+        data.get("rent"),
+        0.0
+    )
+
+    if rent <= 0:
+        return None
+
+    return rent
+
+
+def calculate_investment_margin(
+    estimated_value: float,
+    asking_price: float,
+    repair_cost: float
+) -> float:
+    return (
+        estimated_value
+        - asking_price
+        - repair_cost
+    )
+
+
+def calculate_opportunity_score(
+    discount_percent: float,
+    net_margin: float,
+    rental_yield: float,
+    days_on_market: float,
+    listing_type: str,
+    repair_cost: float,
+    estimated_value: float
+) -> float:
+    score = 0.0
+
+    if discount_percent > 0:
+        score += min(
+            discount_percent * 2.5,
+            40.0
+        )
+
+    if net_margin > 0 and estimated_value > 0:
+        margin_percent = (
+            net_margin
+            / estimated_value
+        ) * 100.0
+
+        score += min(
+            margin_percent * 1.5,
+            30.0
+        )
+
+    if rental_yield > 0:
+        score += min(
+            rental_yield * 2.0,
+            15.0
+        )
+
+    if days_on_market > 60:
+        score += 5.0
+
+    if listing_type in [
+        "Foreclosure",
+        "Short Sale"
+    ]:
+        score += 5.0
+
+    if repair_cost > 0:
+        repair_ratio = (
+            repair_cost
+            / max(
+                estimated_value,
+                1.0
+            )
+        ) * 100.0
+
+        score -= min(
+            repair_ratio,
+            15.0
+        )
+
+    return max(
+        0.0,
+        min(
+            score,
+            100.0
+        )
+    )
+
+
+def analyze_listing(
+    session: requests.Session,
+    listing: Dict[str, Any],
+    avm_cache: Dict[str, Dict[str, Any]],
+    rent_cache: Dict[str, Dict[str, Any]],
+    property_cache: Dict[str, Optional[Dict[str, Any]]]
+) -> Optional[Dict[str, Any]]:
+    address = listing.get(
+        "formattedAddress",
+        ""
+    )
+
+    price = extract_numeric(
+        listing.get("price")
+    )
+
+    bedrooms = extract_numeric(
+        listing.get("bedrooms")
+    )
+
+    bathrooms = extract_numeric(
+        listing.get("bathrooms")
+    )
+
+    sqft = extract_numeric(
+        listing.get("squareFootage")
+    )
+
+    days_on_market = extract_numeric(
+        listing.get("daysOnMarket")
+    )
+
+    listing_type = str(
+        listing.get(
+            "listingType",
+            "Standard"
+        )
+    )
+
+    if not address:
+        return None
+
+    if price <= 0:
+        return None
+
+    if sqft <= 0:
+        return None
+
+    if address not in property_cache:
+        property_cache[address] = fetch_property_record(
+            session,
+            address
+        )
+
+    property_data = property_cache[address]
+
+    avm = fetch_avm_value(
+        session,
+        address,
+        avm_cache
+    )
+
+    if not avm:
+        return None
+
+    estimated_value = extract_numeric(
+        avm.get("price")
+    )
+
+    value_low = extract_numeric(
+        avm.get("priceRangeLow")
+    )
+
+    value_high = extract_numeric(
+        avm.get("priceRangeHigh")
+    )
+
+    if estimated_value <= 0:
+        return None
+
+    rental_estimate = estimate_monthly_rent(
+        session,
+        address,
+        rent_cache
+    )
+
+    repair_data = detect_repair_risks(
+        listing,
+        property_data
+    )
+
+    repair_cost = repair_data[
+        "estimated_repair_cost"
+    ]
+
+    net_margin = calculate_investment_margin(
+        estimated_value,
+        price,
+        repair_cost
+    )
+
+    discount_percent = calculate_price_discount(
+        price,
+        estimated_value
+    )
+
+    rental_yield = calculate_rental_yield(
+        rental_estimate,
+        price
+    )
+
+    opportunity_score = calculate_opportunity_score(
+        discount_percent,
+        net_margin,
+        rental_yield,
+        days_on_market,
+        listing_type,
+        repair_cost,
+        estimated_value
+    )
+
+    return {
+        "address": address,
+        "city": listing.get("city", ""),
+        "state": listing.get("state", ""),
+        "zip_code": listing.get("zipCode", ""),
+        "property_type": listing.get(
+            "propertyType",
+            ""
+        ),
+        "bedrooms": bedrooms,
+        "bathrooms": bathrooms,
+        "square_footage": sqft,
+        "year_built": listing.get(
+            "yearBuilt"
+        ),
+        "asking_price": price,
+        "estimated_value": estimated_value,
+        "value_range_low": value_low,
+        "value_range_high": value_high,
+        "discount_percent": discount_percent,
+        "estimated_repair_cost": repair_cost,
+        "net_investment_margin": net_margin,
+        "monthly_rent_estimate": rental_estimate,
+        "gross_rental_yield": rental_yield,
+        "days_on_market": days_on_market,
+        "listing_type": listing_type,
+        "repair_signals": repair_data[
+            "detected_keywords"
+        ],
+        "opportunity_score": opportunity_score,
+        "avm_comparable_count": len(
+            avm.get(
+                "comparables",
+                []
+            )
+        ),
+        "listing_id": listing.get(
+            "id",
+            ""
+        )
+    }
+
+
+def analyze_market(
+    session: requests.Session,
+    zip_code: str,
+    history_months: int
+) -> Dict[str, Any]:
+    print(
+        "\n[1/5] Downloading market history..."
+    )
+
+    market_data = fetch_market_data(
+        session,
+        zip_code,
+        history_months
+    )
+
+    metrics = calculate_market_metrics(
+        market_data
+    )
+
+    metrics["market_score"] = calculate_market_score(
+        metrics
+    )
+
+    return metrics
+
+
+def print_market_report(
+    zip_code: str,
+    metrics: Dict[str, Any]
+) -> None:
+    print("\n" + "=" * 75)
+    print(
+        f" MARKET ANALYSIS: {zip_code}"
+    )
+    print("=" * 75)
+
+    current_price = metrics.get(
+        "current_sale_price"
+    )
+
+    current_rent = metrics.get(
+        "current_rent"
+    )
+
+    if current_price is not None:
+        print(
+            f"Current Average Sale Price : "
+            f"${current_price:,.0f}"
+        )
+    else:
+        print(
+            "Current Average Sale Price : N/A"
+        )
+
+    if current_rent is not None:
+        print(
+            f"Current Average Rent       : "
+            f"${current_rent:,.0f}/month"
+        )
+    else:
+        print(
+            "Current Average Rent       : N/A"
+        )
+
+    print(
+        f"Sale Growth                 : "
+        f"{metrics.get('sale_growth_percent', 0):+.2f}%"
+    )
+
+    print(
+        f"Rental Growth               : "
+        f"{metrics.get('rental_growth_percent', 0):+.2f}%"
+    )
+
+    print(
+        f"Price Acceleration          : "
+        f"{metrics.get('price_acceleration', 0):+.2f}"
+    )
+
+    print(
+        f"Rental Acceleration         : "
+        f"{metrics.get('rental_acceleration', 0):+.2f}"
+    )
+
+    print(
+        f"Market Signal Score         : "
+        f"{metrics.get('market_score', 0):.1f}/100"
+    )
+
+    print("=" * 75)
+
+
+def analyze_opportunities(
+    session: requests.Session,
+    zip_code: str,
+    max_listings: int,
+    max_avm_requests: int
+) -> List[Dict[str, Any]]:
+    print(
+        "\n[2/5] Downloading active single-family listings..."
+    )
+
+    listings = fetch_sale_listings(
+        session,
+        zip_code,
+        max_listings
+    )
+
+    print(
+        f"[+] Retrieved {len(listings)} active listings."
+    )
+
+    if not listings:
+        return []
+
+    avm_cache = {}
+    rent_cache = {}
+    property_cache = {}
+
+    opportunities = []
+
+    print(
+        "\n[3/5] Running property valuation analysis..."
+    )
+
+    total = min(
+        len(listings),
+        max_avm_requests
+    )
+
+    for index, listing in enumerate(
+        listings[:total],
+        1
+    ):
+        address = listing.get(
+            "formattedAddress",
+            "Unknown"
+        )
+
+        print(
+            f"    [{index:03d}/{total:03d}] "
+            f"{address}"
+        )
+
+        result = analyze_listing(
+            session,
+            listing,
+            avm_cache,
+            rent_cache,
+            property_cache
+        )
+
+        if result is not None:
+            opportunities.append(
+                result
+            )
+
+        time.sleep(
+            0.05
+        )
+
+    return opportunities
+
+
+def filter_opportunities(
+    opportunities: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    filtered = []
+
+    for opportunity in opportunities:
+        asking_price = opportunity[
+            "asking_price"
+        ]
+
+        estimated_value = opportunity[
+            "estimated_value"
+        ]
+
+        net_margin = opportunity[
+            "net_investment_margin"
+        ]
+
+        if asking_price <= 0:
+            continue
+
+        if estimated_value <= 0:
+            continue
+
+        if net_margin <= 0:
+            continue
+
+        filtered.append(
+            opportunity
+        )
+
+    filtered.sort(
+        key=lambda item: (
+            item["opportunity_score"],
+            item["net_investment_margin"]
+        ),
+        reverse=True
+    )
+
+    return filtered
+
+
+def print_opportunity_report(
+    opportunities: List[Dict[str, Any]],
+    top_n: int = 10
+) -> None:
+    print(
+        "\n[4/5] Ranking investment opportunities..."
+    )
+
+    top = opportunities[:top_n]
+
+    print("\n" + "=" * 100)
+    print(
+        " POTENTIAL REAL ESTATE INVESTMENT OPPORTUNITIES"
+    )
+    print("=" * 100)
+
+    if not top:
+        print(
+            "No properties passed the current valuation "
+            "and margin filters."
+        )
+
+        print("=" * 100)
+        return
+
+    for rank, deal in enumerate(
+        top,
+        1
+    ):
+        print(
+            f"\n#{rank:02d} | "
+            f"{deal['address']}"
+        )
+
+        print(
+            f"    Opportunity Score : "
+            f"{deal['opportunity_score']:.1f}/100"
+        )
+
+        print(
+            f"    Asking Price       : "
+            f"${deal['asking_price']:,.0f}"
+        )
+
+        print(
+            f"    AVM Value          : "
+            f"${deal['estimated_value']:,.0f}"
+        )
+
+        print(
+            f"    AVM Range          : "
+            f"${deal['value_range_low']:,.0f} - "
+            f"${deal['value_range_high']:,.0f}"
+        )
+
+        print(
+            f"    Discount to AVM    : "
+            f"{deal['discount_percent']:+.2f}%"
+        )
+
+        print(
+            f"    Estimated Repairs  : "
+            f"${deal['estimated_repair_cost']:,.0f}"
+        )
+
+        print(
+            f"    Net Margin         : "
+            f"${deal['net_investment_margin']:,.0f}"
+        )
+
+        print(
+            f"    Monthly Rent Est.  : "
+            f"{format_currency_or_na(deal['monthly_rent_estimate'])}"
+        )
+
+        print(
+            f"    Gross Rental Yield : "
+            f"{deal['gross_rental_yield']:.2f}%"
+        )
+
+        print(
+            f"    Beds / Baths       : "
+            f"{deal['bedrooms']:.0f} / "
+            f"{deal['bathrooms']:.1f}"
+        )
+
+        print(
+            f"    Square Footage     : "
+            f"{deal['square_footage']:,.0f}"
+        )
+
+        print(
+            f"    Days on Market     : "
+            f"{deal['days_on_market']:.0f}"
+        )
+
+        print(
+            f"    Listing Type       : "
+            f"{deal['listing_type']}"
+        )
+
+        if deal["repair_signals"]:
+            print(
+                f"    Risk Signals       : "
+                f"{', '.join(deal['repair_signals'])}"
+            )
+        else:
+            print(
+                "    Risk Signals       : None detected"
+            )
+
+        print(
+            f"    AVM Comparables    : "
+            f"{deal['avm_comparable_count']}"
+        )
+
+        print("-" * 100)
+
+
+def format_currency_or_na(
+    value: Optional[float]
+) -> str:
+    if value is None:
+        return "N/A"
+
+    return f"${value:,.0f}"
+
+
+def export_csv(
+    opportunities: List[Dict[str, Any]],
+    filename: str
+) -> None:
+    if not opportunities:
+        return
+
+    fields = [
+        "rank",
+        "address",
+        "city",
+        "state",
+        "zip_code",
+        "property_type",
+        "bedrooms",
+        "bathrooms",
+        "square_footage",
+        "year_built",
+        "asking_price",
+        "estimated_value",
+        "value_range_low",
+        "value_range_high",
+        "discount_percent",
+        "estimated_repair_cost",
+        "net_investment_margin",
+        "monthly_rent_estimate",
+        "gross_rental_yield",
+        "days_on_market",
+        "listing_type",
+        "repair_signals",
+        "opportunity_score",
+        "avm_comparable_count",
+        "listing_id"
+    ]
+
+    with open(
+        filename,
+        "w",
+        newline="",
+        encoding="utf-8"
+    ) as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fields
+        )
+
+        writer.writeheader()
+
+        for rank, opportunity in enumerate(
+            opportunities,
+            1
+        ):
+            row = dict(
+                opportunity
+            )
+
+            row["rank"] = rank
+
+            row["repair_signals"] = ", ".join(
+                opportunity.get(
+                    "repair_signals",
+                    []
+                )
+            )
+
+            writer.writerow(
+                {
+                    field: row.get(
+                        field,
+                        ""
+                    )
+                    for field in fields
+                }
+            )
+
+
+def get_api_key() -> str:
+    api_key = os.getenv(
+        "RENTCAST_API_KEY",
+        ""
+    ).strip()
+
+    if api_key:
+        return api_key
+
+    print(
+        "\nRentCast API key not found in environment."
+    )
+
+    api_key = input(
+        "Enter your RentCast API key: "
+    ).strip()
+
+    if not api_key:
+        raise ValueError(
+            "An API key is required."
+        )
+
+    return api_key
+
+
+def get_zip_code() -> str:
+    while True:
+        zip_code = input(
+            "\nEnter the US ZIP code to analyse: "
+        ).strip()
+
+        try:
+            return validate_zip_code(
+                zip_code
+            )
+        except ValueError as e:
+            print(
+                f"[-] {e}"
+            )
+
+
+def get_integer(
+    prompt: str,
+    default: int,
+    minimum: int,
+    maximum: int
+) -> int:
+    while True:
+        raw = input(
+            f"{prompt} [{default}]: "
+        ).strip()
+
+        if not raw:
+            return default
+
+        try:
+            value = int(raw)
+
+            if minimum <= value <= maximum:
+                return value
+
+            print(
+                f"Enter a number between "
+                f"{minimum} and {maximum}."
+            )
+
+        except ValueError:
+            print(
+                "Enter a valid whole number."
+            )
+
+
+def print_summary(
+    zip_code: str,
+    market_metrics: Dict[str, Any],
+    opportunities: List[Dict[str, Any]]
+) -> None:
+    print("\n" + "=" * 75)
+    print(
+        " FINAL ANALYSIS SUMMARY"
+    )
+    print("=" * 75)
+
+    print(
+        f"Target ZIP Code             : {zip_code}"
+    )
+
+    print(
+        f"Market Signal Score         : "
+        f"{market_metrics.get('market_score', 0):.1f}/100"
+    )
+
+    print(
+        f"Active Properties Analysed  : "
+        f"{len(opportunities)}"
+    )
+
+    positive_margin_count = len(
+        [
+            item
+            for item in opportunities
+            if item["net_investment_margin"] > 0
+        ]
+    )
+
+    print(
+        f"Positive Margin Properties  : "
+        f"{positive_margin_count}"
+    )
+
+    if opportunities:
+        best = opportunities[0]
+
+        print(
+            "\nHighest-scoring potential opportunity:"
+        )
+
+        print(
+            f"    {best['address']}"
+        )
+
+        print(
+            f"    Asking Price  : "
+            f"${best['asking_price']:,.0f}"
+        )
+
+        print(
+            f"    Estimated Value: "
+            f"${best['estimated_value']:,.0f}"
+        )
+
+        print(
+            f"    Net Margin    : "
+            f"${best['net_investment_margin']:,.0f}"
+        )
+
+        print(
+            f"    Score         : "
+            f"{best['opportunity_score']:.1f}/100"
+        )
+
+    print("=" * 75)
+
+
+def main() -> None:
+    print("=" * 75)
+    print(
+        " REAL ESTATE MARKET & INVESTMENT OPPORTUNITY SCANNER"
+    )
+    print("=" * 75)
+
+    print(
+        "\nThis program analyses US ZIP codes using RentCast market, "
+        "listing and valuation data."
+    )
+
+    print(
+        "It identifies properties that may be priced below their "
+        "estimated market value after estimated remediation costs."
+    )
+
+    try:
+        api_key = get_api_key()
+
+        zip_code = get_zip_code()
+
+        history_months = get_integer(
+            "\nMonths of market history to analyse",
+            12,
+            3,
+            24
+        )
+
+        max_listings = get_integer(
+            "Maximum active listings to inspect",
+            100,
+            5,
+            500
+        )
+
+        max_avm_requests = get_integer(
+            "Maximum properties to send through AVM",
+            50,
+            1,
+            500
+        )
+
+        session = create_session(
+            api_key
+        )
+
+        market_metrics = analyze_market(
+            session,
+            zip_code,
+            history_months
+        )
+
+        print_market_report(
+            zip_code,
+            market_metrics
+        )
+
+        opportunities = analyze_opportunities(
+            session,
+            zip_code,
+            max_listings,
+            max_avm_requests
+        )
+
+        filtered_opportunities = filter_opportunities(
+            opportunities
+        )
+
+        print_opportunity_report(
+            filtered_opportunities,
+            10
+        )
+
+        print(
+            "\n[5/5] Exporting results..."
+        )
+
+        output_filename = (
+            f"real_estate_opportunities_{zip_code}.csv"
+        )
+
+        export_csv(
+            filtered_opportunities,
+            output_filename
+        )
+
+        print(
+            f"[+] Results saved to: "
+            f"{os.path.abspath(output_filename)}"
+        )
+
+        print_summary(
+            zip_code,
+            market_metrics,
+            filtered_opportunities
+        )
+
+        print(
+            "\nAnalysis complete."
+        )
+
+    except KeyboardInterrupt:
+        print(
+            "\n\nOperation cancelled by user."
+        )
+
+    except requests.exceptions.ConnectionError:
+        print(
+            "\n[-] Could not connect to RentCast."
+        )
+
+        print(
+            "Check your internet connection and try again."
+        )
+
+        sys.exit(1)
+
+    except requests.exceptions.Timeout:
+        print(
+            "\n[-] RentCast request timed out."
+        )
+
+        print(
+            "Try again or reduce the number of properties analysed."
+        )
+
+        sys.exit(1)
+
+    except Exception as e:
+        print(
+            f"\n[-] Program failed: {e}"
+        )
+
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
